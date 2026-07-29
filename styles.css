@@ -427,16 +427,24 @@ html, body {
   backdrop-filter: blur(20px) saturate(130%);
   -webkit-backdrop-filter: blur(20px) saturate(130%);
   box-shadow: var(--shadow);
-  overflow-x: auto;
-  scrollbar-width: thin;
 }
-.bar::-webkit-scrollbar { height: 5px; }
-.bar::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.18); border-radius: 5px; }
 
 .bar-section { display: flex; align-items: center; gap: 8px; flex: none; }
 .divider { width: 1px; align-self: stretch; background: var(--line); flex: none; }
 
-.chips { display: flex; gap: 6px; flex: none; }
+/* Only the effect list scrolls when space runs short, so the buttons to its
+   right are never pushed out of reach. */
+.bar-section-grow { flex: 1 1 auto; min-width: 0; }
+
+.chips {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  scroll-behavior: smooth;
+}
+.chips::-webkit-scrollbar { display: none; }
 
 .chip {
   appearance: none;
