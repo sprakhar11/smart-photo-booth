@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Frame Change — Fingertip Quad Effects</title>
+<meta name="description" content="Webcam hand tracking that builds a live quadrilateral from your thumb and index fingertips and re-colours the video inside it." />
+<link rel="stylesheet" href="styles.css" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='10' fill='%230b0d14'/%3E%3Cpath d='M11 15 L37 10 L40 33 L14 38 Z' fill='none' stroke='%234ad9ff' stroke-width='3' stroke-linejoin='round'/%3E%3C/svg%3E" />
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ══════════ Stage ══════════ -->
+  <main class="stage" id="stage">
+    <!-- Source video: hidden, used only as a texture for the canvas -->
+    <video id="video" playsinline autoplay muted></video>
+
+    <!-- Everything the user sees is rendered here -->
+    <canvas id="view" aria-label="Webcam view with fingertip quadrilateral effect"></canvas>
+
+    <!-- ── Start / loading / error overlay ── -->
+    <div class="overlay" id="overlay">
+      <div class="overlay-card">
+        <div class="logo">
+          <span class="logo-mark" aria-hidden="true">
+            <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2.4"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <path d="M9 14 L38 9 L41 34 L13 40 Z" />
+              <circle cx="9"  cy="14" r="3.2" fill="currentColor" stroke="none"/>
+              <circle cx="38" cy="9"  r="3.2" fill="currentColor" stroke="none"/>
+              <circle cx="41" cy="34" r="3.2" fill="currentColor" stroke="none"/>
+              <circle cx="13" cy="40" r="3.2" fill="currentColor" stroke="none"/>
+            </svg>
+          </span>
+          <div class="logo-text">
+            <h1>Frame Change</h1>
+            <p>Pinch to repaint reality</p>
+          </div>
+        </div>
+
+        <ol class="how">
+          <li>Hold up <b>both hands</b> and spread thumb and index into an <b>L shape</b>. Those four tips are your corners.</li>
+          <li>They build a <b>live quadrilateral</b> that tracks you smoothly — move your hands and the frame follows.</li>
+          <li><b>Touch thumb to index</b> on either hand to change the colour, view and light <b>inside</b> the frame. The frame holds its shape while you tap.</li>
+        </ol>
+
+        <button class="btn btn-primary btn-lg" id="startBtn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/>
+          </svg>
+          Enable camera
+        </button>
+
+        <p class="status" id="status" role="status">Camera stays on your device. Nothing is uploaded.</p>
+      </div>
+    </div>
+
+    <!-- ── Top HUD ── -->
+    <div class="hud hud-top" id="hudTop" hidden>
+      <div class="pill pill-effect">
+        <span class="swatch" id="effectSwatch"></span>
+        <span class="pill-label">Effect</span>
+        <strong id="effectName">—</strong>
+        <span class="counter" id="effectCounter">1/1</span>
+      </div>
+      <div class="pill-group">
+        <div class="pill" id="tracking"><span class="dot" id="trackDot"></span><span id="trackText">Searching…</span></div>
+        <div class="pill mono" id="fps">-- fps</div>
+      </div>
+    </div>
+
+    <!-- ── Centre hint ── -->
+    <div class="hint" id="hint" hidden><span id="hintText"></span></div>
+
+    <!-- ── Bottom HUD ── -->
+    <div class="hud hud-bottom" id="hudBottom" hidden>
+      <div class="bar">
+
+        <div class="bar-section">
+          <button class="btn btn-icon" id="prevBtn" title="Previous effect (←)" aria-label="Previous effect">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                 stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+          </button>
+          <div class="chips" id="chips" role="tablist" aria-label="Effects"></div>
+          <button class="btn btn-icon" id="nextBtn" title="Next effect (→ / Space)" aria-label="Next effect">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                 stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+          </button>
+        </div>
+
+        <div class="divider" aria-hidden="true"></div>
+
+        <div class="bar-section">
+          <label class="slider" title="Higher = steadier lines, lower = faster response">
+            <span>Smoothing</span>
+            <input type="range" id="smoothRange" min="0" max="100" value="62" aria-label="Smoothing amount" />
+            <output id="smoothOut" class="mono">62</output>
+          </label>
+        </div>
+
+        <div class="divider" aria-hidden="true"></div>
+
+        <div class="bar-section">
+          <button class="btn btn-toggle is-on" id="mirrorBtn" title="Mirror view (M)" aria-pressed="true">Mirror</button>
+          <button class="btn btn-toggle" id="skeletonBtn" title="Show hand skeleton (H)" aria-pressed="false">Skeleton</button>
+          <button class="btn btn-icon" id="fullBtn" title="Fullscreen (F)" aria-label="Toggle fullscreen">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M16 21h3a2 2 0 0 0 2-2v-3M8 21H5a2 2 0 0 1-2-2v-3"/>
+            </svg>
+          </button>
+          <button class="btn btn-icon btn-danger" id="stopBtn" title="Stop camera" aria-label="Stop camera">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                 stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+          </button>
+        </div>
+
+      </div>
+    </div>
+  </main>
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
