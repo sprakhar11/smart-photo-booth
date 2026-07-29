@@ -1,21 +1,31 @@
 /* ============================================================================
    Frame Change
    ----------------------------------------------------------------------------
-   Tracks both hands with MediaPipe HandLandmarker, takes the thumb tip and
-   index tip of each hand as four corners, builds a smoothed quadrilateral,
-   and re-renders the webcam feed *inside* that quad with a colour / light
-   treatment. Touching thumb to index on either hand cycles the treatment
-   with a crossfade.
+   Both hands become a four-corner frame:
 
-   Smoothness comes from two things:
-     1. A One Euro filter per tracked point (steady when still, snappy when
-        moving - no constant-lag that a plain lerp gives you).
-     2. The filter is stepped every animation frame, not only when a new
-        detection lands, so 30fps inference still renders at display rate.
+       index tip ──────── top edge ──────── index tip
+           │                                    │
+       thumb tip ─────── bottom edge ────── thumb tip
+
+   The topology is fixed, never re-sorted. That is deliberate: twist one hand
+   and the top and bottom edges cross, so the shape becomes a bowtie and the
+   graded region splits into two triangles. Nonzero winding fills both lobes.
+
+   Gestures
+     - Close your eyes briefly  -> next colour / view / light treatment.
+       A deliberate hold is required because involuntary blinks (~100-150ms)
+       would otherwise scramble the look every few seconds.
+     - Gather all four tips     -> start recording, again to stop, then a
+       download button appears.
+
+   Smoothness comes from a One Euro filter per corner, stepped every animation
+   frame rather than only when a detection lands, so 30fps inference still
+   renders at display rate.
    ========================================================================== */
 
 import {
   HandLandmarker,
+  FaceLandmarker,
   FilesetResolver,
 } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.0/vision_bundle.mjs";
 
@@ -23,10 +33,12 @@ import {
 
 const MP_VERSION = "1.0.0";
 const WASM_ROOT = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/wasm`;
-const MODEL_URL =
+const HAND_MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+const FACE_MODEL_URL =
+  "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
 
-// Landmark indices we care about (MediaPipe hand topology).
+// MediaPipe hand topology indices.
 const L_WRIST = 0;
 const L_THUMB_TIP = 4;
 const L_INDEX_TIP = 8;
@@ -42,27 +54,30 @@ const HAND_BONES = [
 ];
 
 const TUNING = {
-  graceMs: 170,        // keep the quad alive through short detection dropouts
-  refilterMs: 400,     // gone longer than this -> snap filters instead of gliding
-  fadeTau: 0.085,      // quad opacity easing time constant (seconds)
-  transitionMs: 430,   // effect crossfade duration
+  graceMs: 170,      // keep the frame alive through short detection dropouts
+  refilterMs: 400,   // gone longer than this -> snap instead of gliding in
+  fadeTau: 0.085,    // frame opacity easing time constant (seconds)
+  transitionMs: 430, // effect crossfade duration
 
-  // Tips considered touching below pinchOn, released above pinchOff. Measured
-  // relative to hand size, so it behaves the same near or far from the lens.
-  pinchOn: 0.26,
-  pinchOff: 0.44,
-  pinchCooldownMs: 420,
+  // Eye-hold to change effect. Blendshape score 0..1, hysteresis + a hold long
+  // enough to reject the involuntary blinks everyone makes every few seconds.
+  eyeCloseOn: 0.5,
+  eyeCloseOff: 0.3,
+  blinkHoldMs: 280,
+  blinkCooldownMs: 700,
 
-  // Closing the tips is the trigger, but it would also collapse the corner it
-  // owns and destroy the frame being recoloured. So slightly *before* the
-  // trigger fires we freeze that hand's two corners relative to its wrist:
-  // the frame keeps its shape and still follows the hand, then eases back to
-  // the live tips on release.
-  holdOn: 0.62,
-  holdOff: 0.74,
+  // All four tips gathered together toggles recording. Measured as the widest
+  // gap among the four corners, divided by hand size so range does not matter.
+  clusterOn: 0.85,
+  clusterOff: 1.25,
+  clusterHoldMs: 350,
+  recordCooldownMs: 1000,
 
-  minAreaFrac: 0.0035, // below this the quad has no usable interior
+  faceEveryNth: 2,   // face inference cadence; blinks are slow, hands are not
+  recordFps: 30,
+  recordBitrate: 8_000_000,
   cornerRadiusPct: 0.03,
+  minBoxArea: 16,    // below this the frame has no interior worth grading
 };
 
 /* ------------------------------ One Euro filter -------------------------- */
@@ -121,9 +136,9 @@ class SmoothPoint {
 }
 
 /* ------------------------------ effect catalog --------------------------- */
-/* Each effect = a CSS filter applied to a second copy of the video frame,
-   plus an optional composited overlay for tints / light. Both are rendered
-   into an offscreen layer so the crossfade and blend modes stay correct.   */
+/* Each effect = a CSS filter applied to a second copy of the video frame plus
+   an optional composited overlay for tint / light. Both go into an offscreen
+   layer so the crossfade and blend modes stay correct.                     */
 
 const EFFECTS = [
   {
@@ -162,7 +177,6 @@ const EFFECTS = [
       ctx.globalCompositeOperation = "multiply";
       ctx.fillStyle = "rgba(70,255,140,0.92)";
       ctx.fillRect(b.x, b.y, b.w, b.h);
-      // scanlines + edge falloff for the goggle look
       ctx.globalCompositeOperation = "source-over";
       ctx.fillStyle = "rgba(0,0,0,0.16)";
       for (let y = b.y; y < b.y + b.h; y += 4) ctx.fillRect(b.x, y, b.w, 2);
@@ -230,18 +244,18 @@ const EFFECTS = [
   },
 ];
 
-/** Radial darkening gradient used by several effects. */
 function vignette(ctx, b, innerStop, edgeAlpha) {
   const g = ctx.createRadialGradient(b.cx, b.cy, b.r * innerStop, b.cx, b.cy, b.r);
+  const edge = Math.round(255 * (1 - edgeAlpha));
   g.addColorStop(0, "rgba(255,255,255,1)");
-  g.addColorStop(1, `rgba(${Math.round(255 * (1 - edgeAlpha))},${Math.round(255 * (1 - edgeAlpha))},${Math.round(255 * (1 - edgeAlpha))},1)`);
+  g.addColorStop(1, `rgba(${edge},${edge},${edge},1)`);
   return g;
 }
 
 /* ------------------------------ hand slots ------------------------------- */
-/* Two persistent slots. Detections are matched to slots by nearest wrist so
-   a point keeps its identity (and therefore its filter state) even when the
-   hands cross over or handedness flickers.                                 */
+/* Two persistent slots. Detections are matched to slots by nearest wrist, so a
+   corner keeps its identity (and its filter history) even when hands cross or
+   handedness flickers.                                                     */
 
 class HandSlot {
   constructor(id) {
@@ -251,15 +265,11 @@ class HandSlot {
     this.wrist = { x: 0, y: 0 };
     this.span = 1;
     this.lastSeen = -1e9;
-    this.pinching = false;
-    this.pinchGlow = 0;
     this.landmarks = null;
     this.rawThumb = null;
     this.rawIndex = null;
-    this.holding = false;     // corners frozen relative to the wrist
-    this.holdOffsets = null;  // {thumb:{dx,dy}, index:{dx,dy}}
   }
-  resetFilters() { this.thumb.reset(); this.index.reset(); this.holdOffsets = null; this.holding = false; }
+  resetFilters() { this.thumb.reset(); this.index.reset(); }
   isLive(now) { return now - this.lastSeen < TUNING.graceMs; }
 }
 
@@ -295,11 +305,23 @@ const stopBtn = $("stopBtn");
 const smoothRange = $("smoothRange");
 const smoothOut = $("smoothOut");
 
+const eyePill = $("eyePill");
+const eyeText = $("eyeText");
+const eyeHold = $("eyeHold");
+const recPill = $("recPill");
+const recTime = $("recTime");
+const recordBtn = $("recordBtn");
+const recordBtnLabel = $("recordBtnLabel");
+const recPanel = $("recPanel");
+const recMeta = $("recMeta");
+const recDownload = $("recDownload");
+const recDiscard = $("recDiscard");
+
 // Offscreen layer where each effect is composited before being clipped in.
 const fx = document.createElement("canvas");
 const fxCtx = fx.getContext("2d", { alpha: false });
 
-// ctx.filter is what drives the colour grades. Detect it so we can warn.
+// ctx.filter drives the colour grades. Detect it so we can warn if missing.
 const SUPPORTS_FILTER = (() => {
   const probe = document.createElement("canvas").getContext("2d");
   probe.filter = "blur(1px)";
@@ -309,7 +331,8 @@ const SUPPORTS_FILTER = (() => {
 /* ------------------------------ state ----------------------------------- */
 
 const state = {
-  landmarker: null,
+  hands: null,
+  face: null,
   stream: null,
   running: false,
   rafId: 0,
@@ -325,18 +348,51 @@ const state = {
   effect: 0,
   prevEffect: -1,
   transitionStart: -1e9,
-  lastCycle: -1e9,
 
   quadAlpha: 0,
-  quad: null,
+  quad: null,      // [indexA, indexB, thumbB, thumbA] - fixed topology
+  quadKinds: ["index", "index", "thumb", "thumb"],
+
+  eye: {
+    present: false,
+    score: 0,
+    closed: false,
+    closedSince: 0,
+    fired: false,
+    lastFire: -1e9,
+    progress: 0,
+  },
+
+  cluster: {
+    ratio: Infinity,
+    active: false,
+    since: 0,
+    fired: false,
+    lastToggle: -1e9,
+  },
+
+  rec: {
+    recorder: null,
+    stream: null,
+    chunks: [],
+    active: false,
+    startedAt: 0,
+    duration: 0,
+    blob: null,
+    url: null,
+    filename: "",
+  },
 
   ripples: [],
-  pinchHintShown: false,
-  transientHint: null,
+  hintQueue: [],
+  activeHint: null,
+  introShown: false,
 
   lastVideoTime: -1,
+  detectTick: 0,
   lastFrameTs: 0,
   fpsAvg: 0,
+  lastHoldPct: -1,
 };
 
 /* ------------------------------ boot ------------------------------------ */
@@ -344,17 +400,21 @@ const state = {
 buildChips();
 applySmoothing(Number(smoothRange.value));
 syncEffectUI();
+syncRecordUI();
 
 startBtn.addEventListener("click", start);
 stopBtn.addEventListener("click", stop);
 prevBtn.addEventListener("click", () => cycleEffect(-1));
 nextBtn.addEventListener("click", () => cycleEffect(1));
+recordBtn.addEventListener("click", () => toggleRecording(performance.now(), "button"));
+recDownload.addEventListener("click", saveRecording);
+recDiscard.addEventListener("click", discardRecording);
 
 mirrorBtn.addEventListener("click", () => {
   state.mirror = !state.mirror;
   mirrorBtn.classList.toggle("is-on", state.mirror);
   mirrorBtn.setAttribute("aria-pressed", String(state.mirror));
-  // Mirroring flips x, so drop filter history to avoid a sweep across screen.
+  // Mirroring flips x, so drop history to avoid a sweep across the screen.
   state.slots.forEach((s) => s.resetFilters());
 });
 
@@ -375,6 +435,7 @@ window.addEventListener("keydown", (e) => {
   if (e.target instanceof HTMLInputElement) return;
   if (e.code === "Space" || e.key === "ArrowRight") { e.preventDefault(); cycleEffect(1); }
   else if (e.key === "ArrowLeft") { e.preventDefault(); cycleEffect(-1); }
+  else if (e.key === "r" || e.key === "R") toggleRecording(performance.now(), "key");
   else if (e.key === "m" || e.key === "M") mirrorBtn.click();
   else if (e.key === "h" || e.key === "H") skeletonBtn.click();
   else if (e.key === "f" || e.key === "F") fullBtn.click();
@@ -393,7 +454,7 @@ async function start() {
     return fail("This browser has no camera API. Try Chrome, Edge, Firefox or Safari.");
   }
   if (!window.isSecureContext) {
-    return fail("Camera access needs https:// or localhost. Open the page from a local server.");
+    return fail("Camera access needs https:// or localhost. Open the page from a server.");
   }
 
   try {
@@ -410,7 +471,7 @@ async function start() {
   } catch (err) {
     const name = err?.name || "";
     if (name === "NotAllowedError" || name === "SecurityError") {
-      return fail("Camera permission was blocked. Allow it in the address bar, then try again.");
+      return fail("Camera permission was blocked. Allow it in the address bar, then retry.");
     }
     if (name === "NotFoundError" || name === "DevicesNotFoundError") {
       return fail("No camera found on this device.");
@@ -422,21 +483,22 @@ async function start() {
   }
 
   video.srcObject = state.stream;
-  try {
-    await video.play();
-  } catch {
-    /* some browsers resolve play() late; readiness is awaited below */
-  }
+  try { await video.play(); } catch { /* readiness awaited below */ }
   await waitForVideo();
   resize();
 
-  if (!state.landmarker) {
+  if (!state.hands || !state.face) {
     try {
-      setStatus("Loading hand tracking model…", { busy: true });
+      setStatus("Loading hand and face models…", { busy: true });
       const fileset = await FilesetResolver.forVisionTasks(WASM_ROOT);
-      state.landmarker = await createLandmarker(fileset);
+      const [hands, face] = await Promise.all([
+        state.hands ? Promise.resolve(state.hands) : createHands(fileset),
+        state.face ? Promise.resolve(state.face) : createFace(fileset),
+      ]);
+      state.hands = hands;
+      state.face = face;
     } catch (err) {
-      return fail(`Could not load the tracking model: ${err?.message || err}. Check your internet connection.`);
+      return fail(`Could not load the models: ${err?.message || err}. Check your connection.`);
     }
   }
 
@@ -446,7 +508,7 @@ async function start() {
   hudBottom.hidden = false;
 
   if (!SUPPORTS_FILTER) {
-    flashHint("This browser ignores canvas filters, so grades show as tints only.", 5200);
+    flashHint("This browser ignores canvas filters, so grades show as tints only.", 5000);
   }
 
   state.running = true;
@@ -454,32 +516,44 @@ async function start() {
   state.rafId = requestAnimationFrame(loop);
 }
 
-/** GPU delegate is much smoother; fall back to CPU where it is unavailable. */
-async function createLandmarker(fileset) {
-  const options = (delegate) => ({
-    baseOptions: { modelAssetPath: MODEL_URL, delegate },
-    runningMode: "VIDEO",
-    numHands: 2,
-    minHandDetectionConfidence: 0.5,
-    minHandPresenceConfidence: 0.5,
-    minTrackingConfidence: 0.5,
-  });
-  try {
-    return await HandLandmarker.createFromOptions(fileset, options("GPU"));
-  } catch {
-    return await HandLandmarker.createFromOptions(fileset, options("CPU"));
-  }
+/** GPU delegate is much smoother; fall back to CPU where unavailable. */
+async function withDelegateFallback(make) {
+  try { return await make("GPU"); } catch { return await make("CPU"); }
+}
+
+function createHands(fileset) {
+  return withDelegateFallback((delegate) =>
+    HandLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: HAND_MODEL_URL, delegate },
+      runningMode: "VIDEO",
+      numHands: 2,
+      minHandDetectionConfidence: 0.5,
+      minHandPresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    }));
+}
+
+function createFace(fileset) {
+  return withDelegateFallback((delegate) =>
+    FaceLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: FACE_MODEL_URL, delegate },
+      runningMode: "VIDEO",
+      numFaces: 1,
+      outputFaceBlendshapes: true,          // eyeBlinkLeft / eyeBlinkRight
+      outputFacialTransformationMatrixes: false,
+    }));
 }
 
 function waitForVideo() {
   if (video.readyState >= 2 && video.videoWidth) return Promise.resolve();
   return new Promise((resolve) => {
-    const done = () => { video.removeEventListener("loadeddata", done); resolve(); };
-    video.addEventListener("loadeddata", done, { once: true });
+    video.addEventListener("loadeddata", resolve, { once: true });
   });
 }
 
 function stop() {
+  if (state.rec.active) stopRecording(performance.now());
+
   state.running = false;
   cancelAnimationFrame(state.rafId);
   state.stream?.getTracks().forEach((t) => t.stop());
@@ -491,6 +565,7 @@ function stop() {
   state.quadAlpha = 0;
   state.ripples.length = 0;
   state.lastVideoTime = -1;
+  resetEye();
 
   hudTop.hidden = true;
   hudBottom.hidden = true;
@@ -541,26 +616,32 @@ function loop(now) {
 
   resize();
 
-  // Run inference only on genuinely new camera frames.
+  // Inference only on genuinely new camera frames.
   if (video.readyState >= 2 && video.currentTime !== state.lastVideoTime) {
     state.lastVideoTime = video.currentTime;
-    let result = null;
+    state.detectTick++;
+
     try {
-      result = state.landmarker.detectForVideo(video, now);
-    } catch {
-      result = null;
+      const hands = state.hands.detectForVideo(video, now);
+      if (hands) ingestHands(hands, now);
+    } catch { /* skip this frame */ }
+
+    // Hands need every frame for precision; eyelids move far slower.
+    if (state.detectTick % TUNING.faceEveryNth === 0) {
+      try {
+        const face = state.face.detectForVideo(video, now);
+        ingestFace(face, now);
+      } catch { /* skip this frame */ }
     }
-    if (result) ingest(result, now);
   }
 
-  // Filters advance every frame, so motion interpolates at display rate.
   advance(dt, now);
   render(now);
 }
 
 /* ------------------------------ detection intake ------------------------- */
 
-function ingest(result, now) {
+function ingestHands(result, now) {
   const lists = result.landmarks || [];
   const dets = [];
 
@@ -604,7 +685,6 @@ function ingest(result, now) {
   }
 }
 
-/** Distance from a detection to a slot's last known wrist; stale slots are neutral. */
 function matchCost(det, slot, now) {
   if (now - slot.lastSeen > 500) return 1e6;
   return Math.hypot(det.wrist.x - slot.wrist.x, det.wrist.y - slot.wrist.y);
@@ -617,117 +697,345 @@ function toCanvas(lm) {
   };
 }
 
+/* ------------------------------ blink trigger ---------------------------- */
+
+/** Mean of the two eye-blink blendshapes: 0 wide open, 1 fully shut. */
+function ingestFace(result, now) {
+  const shapes = result?.faceBlendshapes?.[0]?.categories;
+  const eye = state.eye;
+
+  if (!shapes || !shapes.length) {
+    resetEye();
+    return;
+  }
+
+  let left = 0, right = 0;
+  for (const c of shapes) {
+    if (c.categoryName === "eyeBlinkLeft") left = c.score;
+    else if (c.categoryName === "eyeBlinkRight") right = c.score;
+  }
+
+  eye.present = true;
+  eye.score = (left + right) / 2;
+
+  if (!eye.closed && eye.score > TUNING.eyeCloseOn) {
+    eye.closed = true;
+    eye.closedSince = now;
+    eye.fired = false;
+  } else if (eye.closed && eye.score < TUNING.eyeCloseOff) {
+    eye.closed = false;
+    eye.fired = false;
+  }
+
+  // Fire once the lids have stayed shut past a natural blink's duration.
+  if (eye.closed && !eye.fired && now - eye.closedSince >= TUNING.blinkHoldMs) {
+    eye.fired = true;
+    if (now - eye.lastFire > TUNING.blinkCooldownMs) {
+      eye.lastFire = now;
+      cycleEffect(1);
+      flashHint(`${EFFECTS[state.effect].name}`, 1100);
+    }
+  }
+}
+
+function resetEye() {
+  const eye = state.eye;
+  eye.present = false;
+  eye.score = 0;
+  eye.closed = false;
+  eye.fired = false;
+  eye.progress = 0;
+}
+
 /* ------------------------------ per-frame update ------------------------- */
 
 function advance(dt, now) {
   for (const slot of state.slots) {
     if (slot.rawThumb && slot.isLive(now)) {
-      // Closeness is always measured on the raw tips. The smoothed corners may
-      // be frozen, so they cannot be trusted to report a touch.
-      const ratio = tipRatio(slot);
-      updateHold(slot, ratio);
-
-      const target = cornerTargets(slot);
-      slot.thumb.update(target.thumb.x, target.thumb.y, dt);
-      slot.index.update(target.index.x, target.index.y, dt);
-
-      detectPinch(slot, ratio, now);
-    } else {
-      slot.pinching = false;
-      slot.holding = false;
-      slot.holdOffsets = null;
+      // Corners track the real tips with no floor, so an edge can close fully.
+      slot.thumb.update(slot.rawThumb.x, slot.rawThumb.y, dt);
+      slot.index.update(slot.rawIndex.x, slot.rawIndex.y, dt);
     }
-    slot.pinchGlow = Math.max(0, slot.pinchGlow - dt * 3.2);
   }
 
   const [a, b] = state.slots;
   const bothLive = a.isLive(now) && b.isLive(now) && a.thumb.primed && b.thumb.primed;
 
-  // Exponential ease -> framerate independent fade of the whole overlay.
+  // Exponential ease -> framerate independent fade.
   const target = bothLive ? 1 : 0;
   state.quadAlpha += (target - state.quadAlpha) * (1 - Math.exp(-dt / TUNING.fadeTau));
   if (Math.abs(state.quadAlpha - target) < 0.002) state.quadAlpha = target;
 
   if (bothLive) {
-    state.quad = orderQuad([
-      { x: a.thumb.x, y: a.thumb.y },
-      { x: a.index.x, y: a.index.y },
-      { x: b.index.x, y: b.index.y },
-      { x: b.thumb.x, y: b.thumb.y },
-    ]);
-  } else if (state.quadAlpha <= 0.002) {
-    state.quad = null;
+    state.quad = buildQuad(a, b);
+    updateCluster(a, b, now);
+  } else {
+    if (state.quadAlpha <= 0.002) state.quad = null;
+    state.cluster.active = false;
+    state.cluster.fired = false;
+    state.cluster.ratio = Infinity;
   }
+
+  // Eye-hold progress for the HUD meter.
+  const eye = state.eye;
+  eye.progress = eye.closed
+    ? Math.min(1, (now - eye.closedSince) / TUNING.blinkHoldMs)
+    : 0;
+
+  if (state.rec.active) state.rec.duration = (now - state.rec.startedAt) / 1000;
 
   state.ripples = state.ripples.filter((r) => now - r.t0 < 620);
 
-  updateTrackingBadge(now, bothLive);
+  updateBadges(now, bothLive);
 }
 
-/** Gap between this hand's tips, normalised by hand size so the reading is the
-    same whether the hand is near the lens or far from it. */
-function tipRatio(slot) {
-  const d = Math.hypot(slot.rawThumb.x - slot.rawIndex.x, slot.rawThumb.y - slot.rawIndex.y);
-  return d / slot.span;
+/** Fixed topology: top edge joins the index tips, bottom edge the thumbs.
+    Never angle-sorted, so twisting a hand crosses the edges into a bowtie. */
+function buildQuad(a, b) {
+  const [left, right] = a.wrist.x <= b.wrist.x ? [a, b] : [b, a];
+  return [
+    { x: left.index.x, y: left.index.y },
+    { x: right.index.x, y: right.index.y },
+    { x: right.thumb.x, y: right.thumb.y },
+    { x: left.thumb.x, y: left.thumb.y },
+  ];
 }
 
-/** Freeze this hand's corners (relative to its wrist) as the tips close in, so
-    the act of triggering a change does not flatten the frame. */
-function updateHold(slot, ratio) {
-  if (!slot.holding && ratio < TUNING.holdOn && slot.thumb.primed) {
-    slot.holding = true;
-    slot.holdOffsets = {
-      thumb: { dx: slot.thumb.x - slot.wrist.x, dy: slot.thumb.y - slot.wrist.y },
-      index: { dx: slot.index.x - slot.wrist.x, dy: slot.index.y - slot.wrist.y },
-    };
-  } else if (slot.holding && ratio > TUNING.holdOff) {
-    slot.holding = false;
-    slot.holdOffsets = null;
-  }
-}
+/* ------------------------------ record gesture --------------------------- */
 
-/** Where this hand's two corners should sit this frame. */
-function cornerTargets(slot) {
-  if (slot.holding && slot.holdOffsets) {
-    const { thumb, index } = slot.holdOffsets;
-    return {
-      thumb: { x: slot.wrist.x + thumb.dx, y: slot.wrist.y + thumb.dy },
-      index: { x: slot.wrist.x + index.dx, y: slot.wrist.y + index.dy },
-    };
-  }
-  return { thumb: slot.rawThumb, index: slot.rawIndex };
-}
-
-/** Tips touching = advance the effect. Hysteresis means one touch counts once. */
-function detectPinch(slot, ratio, now) {
-  if (!slot.pinching && ratio < TUNING.pinchOn) {
-    slot.pinching = true;
-    slot.pinchGlow = 1;
-    state.ripples.push({
-      x: (slot.rawThumb.x + slot.rawIndex.x) / 2,
-      y: (slot.rawThumb.y + slot.rawIndex.y) / 2,
-      t0: now,
-    });
-    if (now - state.lastCycle > TUNING.pinchCooldownMs) {
-      state.lastCycle = now;
-      cycleEffect(1);
+/** Widest gap among the four corners, divided by hand size. Small = gathered. */
+function clusterRatio(a, b) {
+  const pts = [a.thumb, a.index, b.thumb, b.index];
+  let widest = 0;
+  for (let i = 0; i < 4; i++) {
+    for (let j = i + 1; j < 4; j++) {
+      const d = Math.hypot(pts[i].x - pts[j].x, pts[i].y - pts[j].y);
+      if (d > widest) widest = d;
     }
-  } else if (slot.pinching && ratio > TUNING.pinchOff) {
-    slot.pinching = false;
+  }
+  return widest / Math.max(1, (a.span + b.span) / 2);
+}
+
+function updateCluster(a, b, now) {
+  const c = state.cluster;
+  c.ratio = clusterRatio(a, b);
+
+  if (!c.active && c.ratio < TUNING.clusterOn) {
+    c.active = true;
+    c.since = now;
+    c.fired = false;
+  } else if (c.active && c.ratio > TUNING.clusterOff) {
+    c.active = false;
+    c.fired = false;
+  }
+
+  if (c.active && !c.fired && now - c.since >= TUNING.clusterHoldMs) {
+    c.fired = true;
+    if (now - c.lastToggle > TUNING.recordCooldownMs) {
+      c.lastToggle = now;
+      const pts = [a.thumb, a.index, b.thumb, b.index];
+      state.ripples.push({
+        x: pts.reduce((s, p) => s + p.x, 0) / 4,
+        y: pts.reduce((s, p) => s + p.y, 0) / 4,
+        t0: now,
+      });
+      toggleRecording(now, "gesture");
+    }
   }
 }
 
-/** Sort corners by angle around their centroid so edges never cross. */
-function orderQuad(pts) {
-  let cx = 0, cy = 0;
-  for (const p of pts) { cx += p.x; cy += p.y; }
-  cx /= pts.length; cy /= pts.length;
-  return pts
-    .map((p) => ({ ...p, a: Math.atan2(p.y - cy, p.x - cx) }))
-    .sort((m, n) => m.a - n.a);
+/* ------------------------------ recording -------------------------------- */
+
+/* MP4/H.264 is preferred over WebM despite larger files, because the recording
+   is something people take away and open elsewhere: MP4 plays in QuickTime,
+   Photos, iMovie and on phones, while WebM does not open on macOS by default.
+   MediaRecorder's WebM also reports duration as Infinity, which breaks seeking
+   in some players. WebM remains the fallback for browsers without MP4 support. */
+function pickMimeType() {
+  const candidates = [
+    "video/mp4;codecs=avc1.42E01E",
+    "video/mp4;codecs=avc1",
+    "video/mp4",
+    "video/webm;codecs=vp9",
+    "video/webm;codecs=vp8",
+    "video/webm",
+  ];
+  for (const c of candidates) {
+    if (window.MediaRecorder?.isTypeSupported?.(c)) return c;
+  }
+  return "";
 }
 
-function updateTrackingBadge(now, bothLive) {
+function toggleRecording(now, source) {
+  if (state.rec.active) stopRecording(now);
+  else startRecording(now, source);
+}
+
+function startRecording(now, source) {
+  if (state.rec.active) return;
+  if (!window.MediaRecorder || !canvas.captureStream) {
+    flashHint("This browser cannot record video.", 3200);
+    return;
+  }
+  if (!state.running) {
+    flashHint("Start the camera before recording.", 2600);
+    return;
+  }
+
+  let stream;
+  try {
+    stream = canvas.captureStream(TUNING.recordFps);
+  } catch {
+    flashHint("Could not capture the canvas for recording.", 3200);
+    return;
+  }
+
+  const mime = pickMimeType();
+  let recorder;
+  try {
+    recorder = new MediaRecorder(
+      stream,
+      mime ? { mimeType: mime, videoBitsPerSecond: TUNING.recordBitrate } : undefined
+    );
+  } catch {
+    try {
+      recorder = new MediaRecorder(stream);
+    } catch {
+      stream.getTracks().forEach((t) => t.stop());
+      flashHint("This browser cannot record video.", 3200);
+      return;
+    }
+  }
+
+  const rec = state.rec;
+  rec.chunks = [];
+  rec.recorder = recorder;
+  rec.stream = stream;
+  rec.active = true;
+  rec.startedAt = now;
+  rec.duration = 0;
+
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size) rec.chunks.push(e.data); };
+  recorder.onstop = finalizeRecording;
+  recorder.onerror = () => { flashHint("Recording stopped: recorder error.", 3200); };
+
+  // Timeslice keeps chunks flowing so a crash still leaves usable data.
+  recorder.start(1000);
+
+  clearRecordingResult();
+  syncRecordUI();
+  flashHint(source === "gesture" ? "Recording started — gather four tips again to stop" : "Recording started", 2200);
+}
+
+function stopRecording(now) {
+  const rec = state.rec;
+  if (!rec.active) return;
+  rec.duration = (now - rec.startedAt) / 1000;
+  rec.active = false;
+  try {
+    if (rec.recorder && rec.recorder.state !== "inactive") rec.recorder.stop();
+    else finalizeRecording();
+  } catch {
+    finalizeRecording();
+  }
+  syncRecordUI();
+}
+
+function finalizeRecording() {
+  const rec = state.rec;
+  rec.stream?.getTracks().forEach((t) => t.stop());
+  rec.stream = null;
+
+  const type = (rec.recorder?.mimeType || pickMimeType() || "video/webm").split(";")[0];
+  const blob = new Blob(rec.chunks, { type });
+  rec.chunks = [];
+  rec.recorder = null;
+
+  if (!blob.size) {
+    flashHint("Nothing was recorded.", 2600);
+    syncRecordUI();
+    return;
+  }
+
+  if (rec.url) URL.revokeObjectURL(rec.url);
+  rec.blob = blob;
+  rec.url = URL.createObjectURL(blob);
+  rec.filename = `frame-change-${timestamp()}.${type.includes("mp4") ? "mp4" : "webm"}`;
+
+  recDownload.href = rec.url;
+  recDownload.setAttribute("download", rec.filename);
+  recMeta.textContent = `${formatDuration(rec.duration)} · ${formatBytes(blob.size)} · ${type.includes("mp4") ? "MP4" : "WebM"}`;
+  recPanel.hidden = false;
+
+  syncRecordUI();
+  flashHint("Recording ready to download", 2400);
+}
+
+function discardRecording() {
+  clearRecordingResult();
+}
+
+function clearRecordingResult() {
+  const rec = state.rec;
+  if (rec.url) {
+    URL.revokeObjectURL(rec.url);
+    rec.url = null;
+  }
+  rec.blob = null;
+  rec.filename = "";
+  recDownload.removeAttribute("href");
+  recDownload.removeAttribute("download");
+  recPanel.hidden = true;
+}
+
+/* Save through a throwaway anchor built at click time. Relying on the panel's
+   own href/download attributes let a stale pair survive a restart, which once
+   saved a file named after the blob UUID with no extension. */
+function saveRecording(e) {
+  const rec = state.rec;
+  if (!rec.blob) return;
+  e.preventDefault();
+
+  const url = URL.createObjectURL(rec.blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = rec.filename || `frame-change-${timestamp()}.webm`;
+  a.rel = "noopener";
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}
+
+function syncRecordUI() {
+  const on = state.rec.active;
+  recPill.hidden = !on;
+  recordBtn.classList.toggle("is-on", on);
+  recordBtn.setAttribute("aria-pressed", String(on));
+  recordBtnLabel.textContent = on ? "Stop" : "Record";
+}
+
+function timestamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+function formatDuration(sec) {
+  const s = Math.max(0, Math.round(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function formatBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/* ------------------------------ HUD ------------------------------------- */
+
+function updateBadges(now, bothLive) {
   const live = state.slots.filter((s) => s.isLive(now)).length;
   trackDot.classList.toggle("is-locked", bothLive);
   trackDot.classList.toggle("is-lost", live === 0);
@@ -735,12 +1043,10 @@ function updateTrackingBadge(now, bothLive) {
   let steady = null;
   if (bothLive) {
     trackText.textContent = "Frame locked";
-    if (!state.pinchHintShown) {
-      state.pinchHintShown = true;
-      flashHint("Touch thumb to index to change the look", 4200);
-    }
-    if (state.quad && polyArea(state.quad) < TUNING.minAreaFrac * state.W * state.H) {
-      steady = "Spread thumb and index apart to open the frame";
+    if (!state.introShown) {
+      state.introShown = true;
+      flashHint("Close your eyes briefly to change the look", 3600);
+      flashHint("Gather all four tips to start recording", 3600);
     }
   } else if (live === 1) {
     trackText.textContent = "1 hand";
@@ -750,14 +1056,36 @@ function updateTrackingBadge(now, bothLive) {
     steady = "Show both hands, thumb and index spread like an L";
   }
 
-  // A timed message wins while it lasts, then the steady guidance returns.
-  const flash = state.transientHint;
-  if (flash && now < flash.until) setHint(flash.text);
-  else { state.transientHint = null; setHint(steady); }
+  // Eye meter
+  const eye = state.eye;
+  eyePill.classList.toggle("is-open", eye.present && !eye.closed);
+  eyePill.classList.toggle("is-closed", eye.present && eye.closed);
+  const pct = Math.round(eye.progress * 100);
+  if (pct !== state.lastHoldPct) {
+    state.lastHoldPct = pct;
+    eyeHold.style.setProperty("--hold", `${pct}%`);
+  }
+  const eyeLabel = !eye.present ? "No face" : eye.closed ? "Hold…" : "Eyes open";
+  if (eyeText.textContent !== eyeLabel) eyeText.textContent = eyeLabel;
+
+  if (state.rec.active) {
+    const t = formatDuration(state.rec.duration);
+    if (recTime.textContent !== t) recTime.textContent = t;
+  }
+
+  // A queued flash wins while it lasts, then steady guidance returns.
+  if (!state.activeHint && state.hintQueue.length) {
+    const next = state.hintQueue.shift();
+    state.activeHint = { text: next.text, until: now + next.ms };
+  }
+  if (state.activeHint && now < state.activeHint.until) setHint(state.activeHint.text);
+  else { state.activeHint = null; setHint(steady); }
 }
 
 function flashHint(text, ms) {
-  state.transientHint = { text, until: performance.now() + ms };
+  // Cap the queue so rapid triggers cannot make hints lag behind reality.
+  if (state.hintQueue.length >= 2) state.hintQueue.shift();
+  state.hintQueue.push({ text, ms });
 }
 
 function setHint(text) {
@@ -786,10 +1114,10 @@ function render(now) {
   if (quad && alpha > 0.004) {
     const box = bounds(quad);
     const radius = Math.min(box.w, box.h) * TUNING.cornerRadiusPct;
-    const usable = polyArea(quad) >= TUNING.minAreaFrac * W * H;
 
-    // 2. Graded frame, clipped to the quad.
-    if (usable) {
+    // 2. Graded frame, clipped to the shape. Nonzero winding means a crossed
+    //    (twisted) quad fills as two triangles rather than one region.
+    if (box.w * box.h > TUNING.minBoxArea) {
       ctx.save();
       polyPath(ctx, quad, radius);
       ctx.clip();
@@ -805,11 +1133,10 @@ function render(now) {
       ctx.globalAlpha = 1;
     }
 
-    // 3. Frame edges + corners.
-    drawFrame(ctx, quad, radius, alpha, now);
+    // 3. Edges and corners.
+    drawFrame(ctx, quad, radius, alpha);
   }
 
-  // 4. Optional skeleton + pinch feedback.
   if (state.skeleton) drawSkeletons(ctx, now);
   drawRipples(ctx, now);
 
@@ -823,7 +1150,6 @@ function drawVideo(c) {
   c.restore();
 }
 
-/** Composite one effect into the offscreen layer at full opacity. */
 function renderLayer(effect, box) {
   fxCtx.setTransform(1, 0, 0, 1, 0, 0);
   fxCtx.globalAlpha = 1;
@@ -840,16 +1166,18 @@ function renderLayer(effect, box) {
   return fx;
 }
 
-function drawFrame(c, quad, radius, alpha, now) {
+function drawFrame(c, quad, radius, alpha) {
   const scale = Math.min(state.W, state.H) / 720;
   const accent = EFFECTS[state.effect].accent;
-  const pulse = Math.max(...state.slots.map((s) => s.pinchGlow), 0);
+  const pulse = state.eye.progress;
 
   c.save();
   c.lineJoin = "round";
   c.lineCap = "round";
 
-  // Outer glow
+  // Nothing here is recording-tinted on purpose: the canvas is what gets
+  // captured, so a red border would be baked into the exported file. The
+  // recording indicator lives in the HUD, which is not captured.
   c.globalAlpha = alpha * (0.4 + pulse * 0.45);
   c.strokeStyle = accent;
   c.shadowColor = accent;
@@ -858,7 +1186,7 @@ function drawFrame(c, quad, radius, alpha, now) {
   polyPath(c, quad, radius);
   c.stroke();
 
-  // Crisp core line
+  // Crisp core line.
   c.shadowBlur = 0;
   c.globalAlpha = alpha;
   c.strokeStyle = "rgba(255,255,255,0.94)";
@@ -866,22 +1194,24 @@ function drawFrame(c, quad, radius, alpha, now) {
   polyPath(c, quad, radius);
   c.stroke();
 
-  // Corner markers
-  for (const p of quad) {
+  // Corners: index tips take the accent, thumbs read white so the fixed
+  // top/bottom topology is visible at a glance.
+  quad.forEach((p, i) => {
+    const isIndex = state.quadKinds[i] === "index";
     c.globalAlpha = alpha;
     c.beginPath();
-    c.arc(p.x, p.y, (7 + pulse * 4) * scale, 0, TWO_PI);
-    c.fillStyle = accent;
-    c.shadowColor = accent;
-    c.shadowBlur = 14 * scale;
+    c.arc(p.x, p.y, (isIndex ? 7.5 : 6) * scale, 0, TWO_PI);
+    c.fillStyle = isIndex ? accent : "rgba(255,255,255,0.92)";
+    c.shadowColor = isIndex ? accent : "rgba(255,255,255,0.8)";
+    c.shadowBlur = 13 * scale;
     c.fill();
 
     c.shadowBlur = 0;
     c.beginPath();
-    c.arc(p.x, p.y, 3 * scale, 0, TWO_PI);
-    c.fillStyle = "#fff";
+    c.arc(p.x, p.y, 2.8 * scale, 0, TWO_PI);
+    c.fillStyle = isIndex ? "#fff" : "#0b0d14";
     c.fill();
-  }
+  });
 
   c.restore();
 }
@@ -937,7 +1267,8 @@ function drawRipples(c, now) {
 
 /* ------------------------------ geometry helpers ------------------------- */
 
-/** Shoelace area of a closed polygon. */
+/** Shoelace area. Signed contributions cancel on a bowtie, which is why it is
+    only used for reporting, never to decide whether to draw. */
 function polyArea(pts) {
   let a = 0;
   for (let i = 0, n = pts.length; i < n; i++) {
@@ -958,12 +1289,7 @@ function bounds(pts) {
   }
   const w = Math.max(1, maxX - minX);
   const h = Math.max(1, maxY - minY);
-  return {
-    x: minX, y: minY, w, h,
-    cx: minX + w / 2,
-    cy: minY + h / 2,
-    r: Math.max(w, h) * 0.62,
-  };
+  return { x: minX, y: minY, w, h, cx: minX + w / 2, cy: minY + h / 2, r: Math.max(w, h) * 0.62 };
 }
 
 /** Closed polygon with softly rounded corners (quadratic fillets). */
@@ -1049,8 +1375,9 @@ function syncEffectUI() {
     chip.setAttribute("aria-selected", String(active));
   });
 
-  const active = chipsEl.children[state.effect];
-  active?.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" });
+  chipsEl.children[state.effect]?.scrollIntoView({
+    block: "nearest", inline: "nearest", behavior: "smooth",
+  });
 }
 
 /* ------------------------------ smoothing control ------------------------ */
@@ -1070,11 +1397,15 @@ function applySmoothing(v) {
 
 /* ------------------------------ housekeeping ----------------------------- */
 
-/* Debug/tuning handle: lets you inspect live tracking state or force a quad
-   from the console, e.g.
-     frameChange.state.slots[0].thumb        // smoothed corner
-     frameChange.setEffect(3)                // jump to Spotlight            */
-window.frameChange = { state, EFFECTS, TUNING, setEffect, render, advance };
+/* Debug/tuning handle, e.g.
+     frameChange.state.eye.score        // live blink blendshape
+     frameChange.state.cluster.ratio    // four-tip gather closeness
+     frameChange.setEffect(3)                                              */
+window.frameChange = {
+  state, EFFECTS, TUNING,
+  setEffect, render, advance, ingestFace, buildQuad, clusterRatio, polyArea, bounds,
+  startRecording, stopRecording,
+};
 
 document.addEventListener("visibilitychange", () => {
   // Timestamps jump while hidden; clear history so nothing lurches on return.
@@ -1085,5 +1416,6 @@ document.addEventListener("visibilitychange", () => {
 });
 
 window.addEventListener("pagehide", () => {
+  if (state.rec.active) stopRecording(performance.now());
   state.stream?.getTracks().forEach((t) => t.stop());
 });

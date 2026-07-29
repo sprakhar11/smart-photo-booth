@@ -36,14 +36,14 @@
           </span>
           <div class="logo-text">
             <h1>Frame Change</h1>
-            <p>Pinch to repaint reality</p>
+            <p>Blink to repaint reality</p>
           </div>
         </div>
 
         <ol class="how">
-          <li>Hold up <b>both hands</b> and spread thumb and index into an <b>L shape</b>. Those four tips are your corners.</li>
-          <li>They build a <b>live quadrilateral</b> that tracks you smoothly — move your hands and the frame follows.</li>
-          <li><b>Touch thumb to index</b> on either hand to change the colour, view and light <b>inside</b> the frame. The frame holds its shape while you tap.</li>
+          <li>Hold up <b>both hands</b>, thumb and index spread into an <b>L</b>. The top edge joins your two <b>index tips</b>, the bottom edge your two <b>thumbs</b>.</li>
+          <li><b>Close your eyes for a moment</b> to change the colour, view and light inside the frame. A normal blink is ignored, so hold it just briefly.</li>
+          <li><b>Gather all four tips together</b> to start recording, and again to stop. A download button appears when you're done.</li>
         </ol>
 
         <button class="btn btn-primary btn-lg" id="startBtn">
@@ -67,6 +67,20 @@
         <span class="counter" id="effectCounter">1/1</span>
       </div>
       <div class="pill-group">
+        <div class="pill pill-rec" id="recPill" hidden>
+          <span class="rec-dot" aria-hidden="true"></span>
+          <span class="pill-label">Rec</span>
+          <span class="mono" id="recTime">0:00</span>
+        </div>
+        <div class="pill pill-eye" id="eyePill">
+          <svg class="eye-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M1.5 12S5 5.5 12 5.5 22.5 12 22.5 12 19 18.5 12 18.5 1.5 12 1.5 12z"/>
+            <circle cx="12" cy="12" r="3.2"/>
+          </svg>
+          <span id="eyeText">No face</span>
+          <span class="hold" aria-hidden="true"><i id="eyeHold"></i></span>
+        </div>
         <div class="pill" id="tracking"><span class="dot" id="trackDot"></span><span id="trackText">Searching…</span></div>
         <div class="pill mono" id="fps">-- fps</div>
       </div>
@@ -74,6 +88,31 @@
 
     <!-- ── Centre hint ── -->
     <div class="hint" id="hint" hidden><span id="hintText"></span></div>
+
+    <!-- ── Finished recording ── -->
+    <div class="rec-panel" id="recPanel" hidden>
+      <span class="rec-panel-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/>
+        </svg>
+      </span>
+      <div class="rec-panel-info">
+        <strong>Recording ready</strong>
+        <span class="mono" id="recMeta"></span>
+      </div>
+      <a class="btn btn-primary" id="recDownload" download>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>
+        </svg>
+        Download
+      </a>
+      <button class="btn btn-icon" id="recDiscard" title="Discard recording" aria-label="Discard recording">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+             stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
 
     <!-- ── Bottom HUD ── -->
     <div class="hud hud-bottom" id="hudBottom" hidden>
@@ -104,6 +143,10 @@
         <div class="divider" aria-hidden="true"></div>
 
         <div class="bar-section">
+          <button class="btn btn-rec" id="recordBtn" title="Start or stop recording (R)" aria-pressed="false">
+            <span class="rec-dot" aria-hidden="true"></span>
+            <span id="recordBtnLabel">Record</span>
+          </button>
           <button class="btn btn-toggle is-on" id="mirrorBtn" title="Mirror view (M)" aria-pressed="true">Mirror</button>
           <button class="btn btn-toggle" id="skeletonBtn" title="Show hand skeleton (H)" aria-pressed="false">Skeleton</button>
           <button class="btn btn-icon" id="fullBtn" title="Fullscreen (F)" aria-label="Toggle fullscreen">
